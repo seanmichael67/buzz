@@ -1,6 +1,6 @@
 //! NIP-29 and NIP-25 side-effect handlers.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use nostr::{Event, EventBuilder, Kind, Tag};
 use tracing::{info, warn};
@@ -3043,14 +3043,58 @@ pub async fn publish_nip43_member_removed(
     publish_nip43_delta(tenant, state, 8001, target_pubkey_hex, "member-removed").await
 }
 
-/// Reconcile channels that exist in the DB but don't have kind:39000 events.
+fn member_discovery_matches_members(
+    channel_id: Uuid,
+    event: Option<&StoredEvent>,
+    members: &[MemberRecord],
+) -> bool {
+    let Some(event) = event else {
+        return false;
+    };
+    if event.channel_id != Some(channel_id) {
+        return false;
+    }
+
+    let channel_id_str = channel_id.to_string();
+    let has_channel_d_tag = event.event.tags.iter().any(|tag| {
+        let parts = tag.as_slice();
+        parts.len() >= 2 && parts[0] == "d" && parts[1] == channel_id_str
+    });
+    if !has_channel_d_tag {
+        return false;
+    }
+
+    let expected: BTreeSet<(String, String)> = members
+        .iter()
+        .map(|member| (hex::encode(&member.pubkey), member.role.clone()))
+        .collect();
+    let actual: BTreeSet<(String, String)> = event
+        .event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let parts = tag.as_slice();
+            if parts.len() >= 4 && parts[0] == "p" {
+                Some((parts[1].to_string(), parts[3].to_string()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    actual == expected
+}
+
+/// Reconcile channels that exist in the DB but don't have current discovery events.
 ///
 /// This handles the case where channels were created via direct SQL inserts
-/// (e.g. test seed scripts) rather than through the Nostr event pipeline.
-/// Emits kind:39000 (metadata) and kind:39002 (members) for each channel
-/// that is missing its discovery events.
+/// (e.g. test seed scripts) rather than through the Nostr event pipeline, and
+/// cases where a membership transaction committed but a later side effect failed.
+/// Emits kind:39000 (metadata), kind:39001 (admins), and kind:39002 (members)
+/// for each channel that is missing or has stale discovery events.
 ///
-/// Idempotent: checks for existing kind:39000 events before emitting.
+/// Idempotent: compares the latest member discovery event against current DB
+/// membership before emitting.
 pub async fn reconcile_channel_events(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -3064,14 +3108,17 @@ pub async fn reconcile_channel_events(
 
     let mut reconciled = 0u32;
     for channel in &channels {
-        // Check if kind:39000 event already exists for this channel.
         let channel_id_str = channel.id.to_string();
         let existing = match state
             .db
             .query_events(&EventQuery {
-                kinds: Some(vec![39000]),
+                kinds: Some(vec![
+                    KIND_NIP29_GROUP_METADATA as i32,
+                    KIND_NIP29_GROUP_ADMINS as i32,
+                    KIND_NIP29_GROUP_MEMBERS as i32,
+                ]),
                 d_tag: Some(channel_id_str.clone()),
-                limit: Some(1),
+                limit: Some(3),
                 ..EventQuery::for_community(tenant.community())
             })
             .await
@@ -3087,8 +3134,31 @@ pub async fn reconcile_channel_events(
             }
         };
 
-        if existing.is_empty() {
-            // No discovery event — emit one.
+        let has_metadata = existing
+            .iter()
+            .any(|event| event.event.kind.as_u16() as u32 == KIND_NIP29_GROUP_METADATA);
+        let has_admins = existing
+            .iter()
+            .any(|event| event.event.kind.as_u16() as u32 == KIND_NIP29_GROUP_ADMINS);
+        let members_event = existing
+            .iter()
+            .find(|event| event.event.kind.as_u16() as u32 == KIND_NIP29_GROUP_MEMBERS);
+        let members = match state.db.get_members(tenant.community(), channel.id).await {
+            Ok(members) => members,
+            Err(e) => {
+                tracing::warn!(
+                    channel_id = %channel.id,
+                    error = %e,
+                    "reconcile: failed to query channel members"
+                );
+                continue;
+            }
+        };
+
+        if !has_metadata
+            || !has_admins
+            || !member_discovery_matches_members(channel.id, members_event, &members)
+        {
             if let Err(e) = emit_group_discovery_events(tenant, state, channel.id).await {
                 tracing::warn!(
                     channel_id = %channel.id,
@@ -3372,6 +3442,93 @@ fn topic_for_subscription(channel_id: Option<Uuid>) -> EventTopic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn member_record(channel_id: Uuid, pubkey: Vec<u8>, role: &str) -> MemberRecord {
+        MemberRecord {
+            channel_id,
+            pubkey,
+            role: role.to_string(),
+            joined_at: chrono::Utc::now(),
+            invited_by: None,
+            removed_at: None,
+        }
+    }
+
+    fn members_event(channel_id: Uuid, tags: Vec<Tag>) -> StoredEvent {
+        let event = EventBuilder::new(Kind::Custom(KIND_NIP29_GROUP_MEMBERS as u16), "")
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("sign members event");
+        StoredEvent::new(event, Some(channel_id))
+    }
+
+    #[test]
+    fn member_discovery_matches_current_membership() {
+        let channel_id = Uuid::new_v4();
+        let member = vec![3_u8; 32];
+        let member_hex = hex::encode(&member);
+        let event = members_event(
+            channel_id,
+            vec![
+                Tag::parse(["d", &channel_id.to_string()]).unwrap(),
+                Tag::parse(["p", &member_hex, "", "member"]).unwrap(),
+            ],
+        );
+
+        assert!(member_discovery_matches_members(
+            channel_id,
+            Some(&event),
+            &[member_record(channel_id, member, "member")]
+        ));
+    }
+
+    #[test]
+    fn member_discovery_rejects_stale_missing_cli_added_member() {
+        let channel_id = Uuid::new_v4();
+        let owner = vec![1_u8; 32];
+        let added = vec![2_u8; 32];
+        let owner_hex = hex::encode(&owner);
+        let event = members_event(
+            channel_id,
+            vec![
+                Tag::parse(["d", &channel_id.to_string()]).unwrap(),
+                Tag::parse(["p", &owner_hex, "", "owner"]).unwrap(),
+            ],
+        );
+
+        assert!(
+            !member_discovery_matches_members(
+                channel_id,
+                Some(&event),
+                &[
+                    member_record(channel_id, owner, "owner"),
+                    member_record(channel_id, added, "member"),
+                ],
+            ),
+            "a stale kind:39002 without the add-member target must be reconciled"
+        );
+    }
+
+    #[test]
+    fn member_discovery_rejects_wrong_channel_snapshot() {
+        let canonical_channel = Uuid::new_v4();
+        let wrong_channel = Uuid::new_v4();
+        let member = vec![4_u8; 32];
+        let member_hex = hex::encode(&member);
+        let event = members_event(
+            wrong_channel,
+            vec![
+                Tag::parse(["d", &wrong_channel.to_string()]).unwrap(),
+                Tag::parse(["p", &member_hex, "", "member"]).unwrap(),
+            ],
+        );
+
+        assert!(!member_discovery_matches_members(
+            canonical_channel,
+            Some(&event),
+            &[member_record(canonical_channel, member, "member")]
+        ));
+    }
 
     #[test]
     fn delete_tombstone_omits_absent_moderation_metadata() {

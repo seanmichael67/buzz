@@ -2110,6 +2110,8 @@ pub async fn run_prompt_task(
                             &source,
                             &control_signal,
                         );
+                        publish_agent_text_response_if_any(&ctx, &source, batch.as_ref(), &mut agent)
+                            .await;
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
                             &ctx,
@@ -2171,6 +2173,7 @@ pub async fn run_prompt_task(
                 agent.state.invalidate(&source);
             }
 
+            publish_agent_text_response_if_any(&ctx, &source, batch.as_ref(), &mut agent).await;
             let core_stop = acp_stop_to_core(&stop_reason);
             let usage = agent.acp.take_turn_usage();
             publish_agent_turn_metric(
@@ -3909,6 +3912,72 @@ pub(crate) async fn post_failure_notice(
     }
 }
 
+fn build_agent_text_response_event(
+    keys: &nostr::Keys,
+    channel_id: Uuid,
+    thread_tags: &ThreadTags,
+    content: &str,
+) -> Result<nostr::Event, String> {
+    let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
+        let root_id = nostr::EventId::from_hex(root).ok()?;
+        let parent_id = thread_tags
+            .parent_event_id
+            .as_deref()
+            .and_then(|p| nostr::EventId::from_hex(p).ok())
+            .unwrap_or(root_id);
+        Some(buzz_sdk::ThreadRef {
+            root_event_id: root_id,
+            parent_event_id: parent_id,
+        })
+    });
+    let builder =
+        buzz_sdk::build_message(channel_id, content, thread_ref.as_ref(), &[], false, &[])
+            .map_err(|e| format!("build failed: {e}"))?;
+    builder
+        .sign_with_keys(keys)
+        .map_err(|e| format!("sign failed: {e}"))
+}
+
+pub(crate) async fn post_agent_text_response(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    thread_tags: &ThreadTags,
+    content: &str,
+) {
+    let event = match build_agent_text_response_event(&rest.keys, channel_id, thread_tags, content)
+    {
+        Ok(event) => event,
+        Err(e) => {
+            tracing::warn!(channel = %channel_id, "agent text response: {e}");
+            return;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "agent text response failed: {e}"),
+        Err(_) => tracing::warn!(channel = %channel_id, "agent text response timed out"),
+    }
+}
+
+async fn publish_agent_text_response_if_any(
+    ctx: &PromptContext,
+    source: &PromptSource,
+    batch: Option<&FlushBatch>,
+    agent: &mut OwnedAgent,
+) {
+    let Some(text) = agent.acp.take_turn_agent_text() else {
+        return;
+    };
+    let PromptSource::Channel(channel_id) = source else {
+        return;
+    };
+    let thread_tags = batch
+        .and_then(|batch| batch.events.last())
+        .map(|event| crate::queue::parse_thread_tags(&event.event))
+        .unwrap_or_default();
+    post_agent_text_response(&ctx.rest_client, *channel_id, &thread_tags, &text).await;
+}
+
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
 ///
 /// Queries kind:7 reactions by our pubkey targeting the event, finds the matching
@@ -4055,6 +4124,44 @@ mod tests {
             .env
             .iter()
             .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME"));
+    }
+
+    #[test]
+    fn agent_text_response_event_is_threaded_kind9_channel_message() {
+        let keys = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let channel_id_str = channel_id.to_string();
+        let root_hex = format!("{}1", "0".repeat(63));
+        let parent_hex = format!("{}2", "0".repeat(63));
+        let thread_tags = ThreadTags {
+            root_event_id: Some(root_hex.clone()),
+            parent_event_id: Some(parent_hex.clone()),
+            mentioned_pubkeys: Vec::new(),
+        };
+
+        let event =
+            build_agent_text_response_event(&keys, channel_id, &thread_tags, "visible response")
+                .expect("response event");
+
+        assert_eq!(event.kind.as_u16(), 9);
+        assert_eq!(event.content, "visible response");
+        assert!(event.tags.iter().any(|tag| {
+            let parts = tag.as_slice();
+            parts.first().map(String::as_str) == Some("h")
+                && parts.get(1).map(String::as_str) == Some(channel_id_str.as_str())
+        }));
+        assert!(event.tags.iter().any(|tag| {
+            let parts = tag.as_slice();
+            parts.first().map(String::as_str) == Some("e")
+                && parts.get(1).map(String::as_str) == Some(root_hex.as_str())
+                && parts.get(3).map(String::as_str) == Some("root")
+        }));
+        assert!(event.tags.iter().any(|tag| {
+            let parts = tag.as_slice();
+            parts.first().map(String::as_str) == Some("e")
+                && parts.get(1).map(String::as_str) == Some(parent_hex.as_str())
+                && parts.get(3).map(String::as_str) == Some("reply")
+        }));
     }
 
     #[test]

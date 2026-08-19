@@ -211,6 +211,10 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Plain assistant text streamed via ACP `agent_message_chunk` during the
+    /// current turn. The pool consumes this after a successful channel prompt
+    /// and publishes it as a Buzz message.
+    turn_agent_text: String,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -550,6 +554,7 @@ impl AcpClient {
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            turn_agent_text: String::new(),
         })
     }
 
@@ -776,6 +781,7 @@ impl AcpClient {
         // prompt so that any setup notifications recorded earlier are not
         // misattributed to this turn.
         self.goose_usage.begin_turn(session_id);
+        self.turn_agent_text.clear();
 
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
@@ -879,6 +885,17 @@ impl AcpClient {
     /// publish a kind 44200 NIP-AM event.
     pub fn take_turn_usage(&mut self) -> Option<TurnUsage> {
         self.goose_usage.take()
+    }
+
+    /// Consume assistant text streamed during the current turn.
+    pub fn take_turn_agent_text(&mut self) -> Option<String> {
+        let text = self.turn_agent_text.trim().to_string();
+        self.turn_agent_text.clear();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     /// Install a per-turn steer request channel for goose-native
@@ -1732,6 +1749,7 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    self.turn_agent_text.push_str(text);
                 }
                 false
             }
@@ -2995,6 +3013,43 @@ mod tests {
         assert!(
             matches!(result, Err(AcpError::HardTimeout { .. })),
             "expected HardTimeout, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_message_chunks_are_collected_for_channel_publish() {
+        let mut client = spawn_script("sleep 10").await;
+        let first = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "text": "hello " }
+                }
+            }
+        });
+        let second = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "text": "world" }
+                }
+            }
+        });
+
+        assert!(!client.handle_session_update(&first));
+        assert!(!client.handle_session_update(&second));
+
+        assert_eq!(
+            client.take_turn_agent_text().as_deref(),
+            Some("hello world")
+        );
+        assert!(
+            client.take_turn_agent_text().is_none(),
+            "response text is consumed once"
         );
     }
 
