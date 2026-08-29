@@ -223,6 +223,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loopback_host_variants_bind_to_the_same_community() {
+        let r = resolver_with("localhost:3000", 99);
+        for variant in ["localhost:3000", "127.0.0.1:3000", "[::1]:3000"] {
+            let ctx = bind_community(&r, variant)
+                .await
+                .unwrap_or_else(|_| panic!("loopback variant {variant:?} should bind"));
+            assert_eq!(
+                ctx.community().as_uuid(),
+                &Uuid::from_u128(99),
+                "variant {variant:?}"
+            );
+            assert_eq!(ctx.host(), "localhost:3000", "variant {variant:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn deployment_url_normalizes_default_ports() {
         let r = resolver_with("relay.example", 9);
         for url in ["ws://relay.example:80", "wss://relay.example:443"] {
@@ -236,8 +252,12 @@ mod tests {
 
     #[test]
     fn relay_url_authority_preserves_ipv6_brackets() {
-        assert_eq!(relay_url_authority("ws://[::1]:3000"), "[::1]:3000");
-        assert_eq!(relay_url_authority("wss://[::1]:443"), "[::1]");
+        assert_eq!(relay_url_authority("ws://[::1]:3000"), "localhost:3000");
+        assert_eq!(relay_url_authority("wss://[::1]:443"), "localhost");
+        assert_eq!(
+            relay_url_authority("ws://[2001:db8::1]:3000"),
+            "[2001:db8::1]:3000"
+        );
     }
 
     #[tokio::test]
