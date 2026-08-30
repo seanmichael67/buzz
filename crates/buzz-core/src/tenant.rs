@@ -297,8 +297,12 @@ mod tests {
     #[test]
     fn relay_url_authority_preserves_ipv6_brackets() {
         // `host_str()` strips IPv6 brackets and the port; `relay_url_authority`
-        // must still derive the same loopback authority as Host normalization.
+        // must still derive the same authority as Host normalization.
         assert_eq!(relay_url_authority("ws://[::1]:3000"), "localhost:3000");
+        assert_eq!(
+            relay_url_authority("ws://[2001:db8::1]:3000"),
+            "[2001:db8::1]:3000"
+        );
     }
 
     #[test]
