@@ -421,7 +421,8 @@ mod tests {
 
     #[test]
     fn host_accepts_ipv6_bracket_literal() {
-        assert!(validate_host("[::1]:3000").is_ok());
+        assert!(validate_host("[2001:db8::1]:3000").is_ok());
+        assert!(validate_host("[::1]:3000").is_err());
     }
 
     #[test]
@@ -433,6 +434,10 @@ mod tests {
         assert_eq!(
             normalize_candidate_host("acme.example.").unwrap(),
             "acme.example"
+        );
+        assert_eq!(
+            normalize_candidate_host("[::1]:3000").unwrap(),
+            "localhost:3000"
         );
     }
 
