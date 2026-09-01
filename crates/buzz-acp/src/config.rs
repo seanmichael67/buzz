@@ -821,6 +821,35 @@ pub fn propagate_legacy_env_vars() {
     }
 }
 
+/// Collapse loopback aliases (`127.0.0.1`, `[::1]`, `::1`) in the relay URL's
+/// authority to `localhost`, keeping the scheme and any explicit port.
+///
+/// The relay binds its community from the canonical host
+/// (`buzz_core::tenant::normalize_host`), and `nip98_expected_url` inherits
+/// that canonical form — while NIP-98 deliberately treats loopback aliases as
+/// distinct hosts. A harness launched at `ws://127.0.0.1:3000` (the Desktop
+/// spawner's hardcoded default) therefore signs bridge requests for a host
+/// the relay never expects and gets 401 on every `/query`. Normalizing once
+/// at config time keeps the WebSocket, HTTP bridge, and NIP-98 `u` tags
+/// consistent with the relay's community canonicalization.
+///
+/// URLs with a path, query, or fragment are left untouched — relay URLs are
+/// bare `scheme://authority`, and anything else is not ours to rewrite.
+fn normalize_relay_url(relay_url: &str) -> String {
+    let Ok(parsed) = Url::parse(relay_url) else {
+        return relay_url.to_string();
+    };
+    if !matches!(parsed.path(), "" | "/") || parsed.query().is_some() || parsed.fragment().is_some()
+    {
+        return relay_url.to_string();
+    }
+    let authority = buzz_core::tenant::relay_url_authority(relay_url);
+    if authority.is_empty() {
+        return relay_url.to_string();
+    }
+    format!("{}://{authority}", parsed.scheme())
+}
+
 impl Config {
     pub fn from_cli() -> Result<Self, ConfigError> {
         // Legacy env-var propagation is intentionally NOT done here.
@@ -834,6 +863,15 @@ impl Config {
     /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
     /// validation path without going through process args.
     pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
+        let normalized_relay_url = normalize_relay_url(&args.relay_url);
+        if normalized_relay_url != args.relay_url {
+            tracing::info!(
+                from = %args.relay_url,
+                to = %normalized_relay_url,
+                "normalized loopback relay URL to canonical host"
+            );
+            args.relay_url = normalized_relay_url;
+        }
         let keys = Keys::parse(&args.private_key)?;
         // Best-effort zeroize: overwrite the raw private key string to reduce
         // exposure via core dumps or heap inspection (#41). Without the `zeroize`
@@ -2184,6 +2222,54 @@ channels = "ALL"
             "120",
         ]);
         assert_eq!(configured.exit_after_inactivity, 120);
+    }
+
+    #[test]
+    fn loopback_relay_urls_normalize_to_localhost() {
+        assert_eq!(
+            normalize_relay_url("ws://127.0.0.1:3000"),
+            "ws://localhost:3000"
+        );
+        assert_eq!(
+            normalize_relay_url("ws://[::1]:3000"),
+            "ws://localhost:3000"
+        );
+        assert_eq!(
+            normalize_relay_url("ws://localhost:3000"),
+            "ws://localhost:3000"
+        );
+    }
+
+    #[test]
+    fn non_loopback_and_non_bare_relay_urls_unchanged() {
+        assert_eq!(
+            normalize_relay_url("wss://relay.example.com:8080"),
+            "wss://relay.example.com:8080"
+        );
+        // A path, query, or fragment means the URL is not a bare relay
+        // authority — leave it alone rather than silently dropping parts.
+        assert_eq!(
+            normalize_relay_url("ws://127.0.0.1:3000/path"),
+            "ws://127.0.0.1:3000/path"
+        );
+        assert_eq!(normalize_relay_url("not a url"), "not a url");
+    }
+
+    #[test]
+    fn from_args_normalizes_loopback_relay_url() {
+        // The Desktop spawner injects ws://127.0.0.1:3000 regardless of
+        // workspace config; the config layer must canonicalize it so NIP-98
+        // `u` tags match the relay's community host.
+        let key = "1".repeat(64);
+        let config = Config::from_args(CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--relay-url",
+            "ws://127.0.0.1:3000",
+        ]))
+        .expect("valid config");
+        assert_eq!(config.relay_url, "ws://localhost:3000");
     }
 
     #[test]
